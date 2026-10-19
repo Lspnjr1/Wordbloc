@@ -1,171 +1,108 @@
-// Advanced Learning System
+// Advanced Learning System - Now powered by SM-2 Spaced Repetition
+// This class is now a thin wrapper around the SRSEngine for backward compatibility
 class AdaptiveLearningEngine {
     constructor() {
-        this.difficultyLevel = 1.0; // 0.5 = easier, 2.0 = harder
-        this.performanceHistory = [];
-        this.spacedRepetition = new Map();
+        this.srsEngine = new SRSEngine();
         this.analytics = new LearningAnalytics();
+        this.childId = null;
+        this.difficultyLevel = 1;
     }
 
-    adjustDifficulty(isCorrect, timeToComplete) {
-        const performance = {
-            correct: isCorrect,
-            time: timeToComplete,
-            timestamp: Date.now()
-        };
-        
-        this.performanceHistory.push(performance);
-        
-        // Keep only last 10 attempts for calculation
-        if (this.performanceHistory.length > 10) {
-            this.performanceHistory.shift();
-        }
-        
-        const recentCorrect = this.performanceHistory.filter(p => p.correct).length;
-        const accuracy = recentCorrect / this.performanceHistory.length;
-        
-        // Adjust difficulty based on performance
-        if (accuracy > 0.8 && this.difficultyLevel < 2.0) {
-            this.difficultyLevel += 0.1;
-        } else if (accuracy < 0.6 && this.difficultyLevel > 0.5) {
-            this.difficultyLevel -= 0.1;
-        }
-        
-        this.analytics.recordAttempt(performance);
-    }
-
-    scheduleSpacedRepetition(word, difficulty) {
-        const now = Date.now();
-        const intervals = [1, 3, 7, 14, 30]; // days
-        const currentInterval = this.spacedRepetition.get(word)?.interval || 0;
-        const nextInterval = intervals[Math.min(currentInterval + 1, intervals.length - 1)];
-        
-        this.spacedRepetition.set(word, {
-            nextReview: now + (nextInterval * 24 * 60 * 60 * 1000),
-            interval: currentInterval + 1,
-            difficulty: difficulty
-        });
-    }
-
-    getWordsForReview() {
-        const now = Date.now();
-        const wordsToReview = [];
-        
-        for (const [word, data] of this.spacedRepetition) {
-            if (data.nextReview <= now) {
-                wordsToReview.push(word);
+    initialize(childId) {
+        this.childId = childId || (typeof telemetry !== 'undefined' ? telemetry.getActiveChildId() : 'default');
+        if (typeof telemetry !== 'undefined') {
+            telemetry.setActiveChild(this.childId);
+            this.analytics = telemetry.forChild(this.childId);
+            if (typeof rewardSystem !== 'undefined' && rewardSystem.setChild) {
+                rewardSystem.setChild(this.childId);
             }
         }
-        
-        return wordsToReview;
+        this.srsEngine.initialize(this.childId);
+    }
+
+    /**
+     * Record a word attempt with quality grading
+     * Quality is determined by correctness and response time
+     */
+    recordAttempt(word, category, isCorrect, responseTimeMs) {
+        // Determine quality grade (0-5)
+        let quality;
+        if (!isCorrect) {
+            quality = 0; // Complete failure
+        } else if (responseTimeMs < 3000) {
+            quality = 5; // Perfect (correct + fast)
+        } else if (responseTimeMs < 5000) {
+            quality = 4; // Correct with slight hesitation
+        } else if (responseTimeMs < 10000) {
+            quality = 3; // Correct but difficult
+        } else {
+            quality = 2; // Correct but very slow
+        }
+
+        // Record in SRS engine
+        const wordId = word; // Use word as ID for simplicity
+        const state = this.srsEngine.recordResponse(wordId, word, category, quality, responseTimeMs);
+
+        this.analytics.recordAttempt({
+            correct: isCorrect,
+            durationMs: responseTimeMs,
+            timestamp: Date.now(),
+            category: category,
+            word: word,
+            locale: (typeof currentLanguage !== 'undefined' && currentLanguage) ? currentLanguage : 'en',
+            mode: (typeof gameModeManager !== 'undefined' && gameModeManager.currentMode) ? gameModeManager.currentMode : 'classic',
+            hintCount: (typeof telemetry !== 'undefined') ? telemetry.currentHintCount : 0
+        });
+
+        return state;
+    }
+
+    /**
+     * Build session word queue driven by mastery model
+     */
+    getSessionQueue(allWords, category = null, ageBand = null) {
+        return this.srsEngine.buildSessionQueue(allWords, category, ageBand, 10);
+    }
+
+    /**
+     * Get words due for review
+     */
+    getWordsForReview() {
+        const dueReviews = this.srsEngine.getDueReviews();
+        return dueReviews.map(state => state.word);
+    }
+
+    /**
+     * Get mastery report for dashboard
+     */
+    getMasteryReport() {
+        return this.srsEngine.getMasteryReport();
+    }
+
+    /**
+     * Calculate word difficulty (combines population data + child history)
+     */
+    getWordDifficulty(word) {
+        return this.srsEngine.calculateWordDifficulty(word);
+    }
+
+    /**
+     * Legacy method for backward compatibility - now uses SRS data
+     */
+    adjustDifficulty(isCorrect, timeToComplete) {
+        // This is now handled by recordAttempt with quality grading
+        console.warn('adjustDifficulty is deprecated, use recordAttempt instead');
+    }
+
+    /**
+     * Legacy method for backward compatibility
+     */
+    scheduleSpacedRepetition(word, difficulty) {
+        console.warn('scheduleSpacedRepetition is deprecated, use recordAttempt instead');
     }
 }
 
-class LearningAnalytics {
-    constructor() {
-        this.sessions = [];
-        this.currentSession = null;
-    }
-
-    startSession() {
-        this.currentSession = {
-            startTime: Date.now(),
-            attempts: [],
-            wordsLearned: [],
-            totalTime: 0
-        };
-    }
-
-    recordAttempt(attempt) {
-        if (this.currentSession) {
-            this.currentSession.attempts.push(attempt);
-        }
-    }
-
-    endSession() {
-        if (this.currentSession) {
-            this.currentSession.endTime = Date.now();
-            this.currentSession.totalTime = this.currentSession.endTime - this.currentSession.startTime;
-            this.sessions.push(this.currentSession);
-            this.saveAnalytics();
-            this.currentSession = null;
-        }
-    }
-
-    getProgressReport() {
-        const totalSessions = this.sessions.length;
-        const totalAttempts = this.sessions.reduce((sum, s) => sum + s.attempts.length, 0);
-        const correctAttempts = this.sessions.reduce((sum, s) => 
-            sum + s.attempts.filter(a => a.correct).length, 0);
-        const accuracy = totalAttempts > 0 ? (correctAttempts / totalAttempts) * 100 : 0;
-        
-        return {
-            totalSessions,
-            totalAttempts,
-            accuracy: Math.round(accuracy),
-            averageSessionTime: totalSessions > 0 ? 
-                Math.round(this.sessions.reduce((sum, s) => sum + s.totalTime, 0) / totalSessions / 1000) : 0,
-            weakAreas: this.identifyWeakAreas(),
-            strongAreas: this.identifyStrongAreas()
-        };
-    }
-
-    identifyWeakAreas() {
-        // Analyze which categories have lower accuracy
-        const categoryPerformance = {};
-        this.sessions.forEach(session => {
-            session.attempts.forEach(attempt => {
-                const category = attempt.category || 'unknown';
-                if (!categoryPerformance[category]) {
-                    categoryPerformance[category] = { correct: 0, total: 0 };
-                }
-                categoryPerformance[category].total++;
-                if (attempt.correct) categoryPerformance[category].correct++;
-            });
-        });
-        
-        return Object.entries(categoryPerformance)
-            .map(([cat, perf]) => ({ 
-                category: cat, 
-                accuracy: (perf.correct / perf.total) * 100 
-            }))
-            .filter(item => item.accuracy < 70)
-            .sort((a, b) => a.accuracy - b.accuracy);
-    }
-
-    identifyStrongAreas() {
-        const categoryPerformance = {};
-        this.sessions.forEach(session => {
-            session.attempts.forEach(attempt => {
-                const category = attempt.category || 'unknown';
-                if (!categoryPerformance[category]) {
-                    categoryPerformance[category] = { correct: 0, total: 0 };
-                }
-                categoryPerformance[category].total++;
-                if (attempt.correct) categoryPerformance[category].correct++;
-            });
-        });
-        
-        return Object.entries(categoryPerformance)
-            .map(([cat, perf]) => ({ 
-                category: cat, 
-                accuracy: (perf.correct / perf.total) * 100 
-            }))
-            .filter(item => item.accuracy >= 80)
-            .sort((a, b) => b.accuracy - a.accuracy);
-    }
-
-    saveAnalytics() {
-        localStorage.setItem('spellbloc_analytics', JSON.stringify(this.sessions));
-    }
-
-    loadAnalytics() {
-        const saved = localStorage.getItem('spellbloc_analytics');
-        if (saved) {
-            this.sessions = JSON.parse(saved);
-        }
-    }
-}
+// LearningAnalytics lives in telemetry.js (single event stream for reports + rewards).
 
 // Game Modes
 class GameModeManager {
@@ -361,13 +298,22 @@ class TimedMode {
             timerElement.textContent = `⏰ ${this.timeRemaining}s`;
             
             // Change color based on time remaining
+            if (this.timeRemaining === 10) {
+                window.announce('10 seconds remaining!', true);
+            }
             if (this.timeRemaining <= 10) {
                 timerElement.style.color = '#ef4444'; // Red
-                timerElement.style.animation = 'pulse 1s infinite';
+                if (!accessibilityManager.settings.reducedMotion) {
+                    timerElement.style.animation = 'pulse 1s infinite';
+                } else {
+                    timerElement.style.animation = 'none';
+                }
             } else if (this.timeRemaining <= 20) {
                 timerElement.style.color = '#f59e0b'; // Orange
+                timerElement.style.animation = 'none';
             } else {
                 timerElement.style.color = '#10b981'; // Green
+                timerElement.style.animation = 'none';
             }
         }
     }
@@ -475,6 +421,16 @@ class PuzzleMode {
     }
 }
 
+// Accessibility Helper
+window.announce = function(message, assertive = false) {
+    const announcer = document.getElementById('accessibilityAnnouncer');
+    if (announcer) {
+        announcer.setAttribute('aria-live', assertive ? 'assertive' : 'polite');
+        announcer.textContent = message;
+        setTimeout(() => { announcer.textContent = ''; }, 3000);
+    }
+};
+
 // Accessibility Features
 class AccessibilityManager {
     constructor() {
@@ -484,7 +440,7 @@ class AccessibilityManager {
             fontSize: 'normal',
             colorBlindSupport: false,
             screenReader: false,
-            reducedMotion: false
+            reducedMotion: window.matchMedia ? window.matchMedia('(prefers-reduced-motion: reduce)').matches : false
         };
         this.loadSettings();
     }
@@ -510,8 +466,8 @@ class AccessibilityManager {
 
     enableScreenReader() {
         this.settings.screenReader = true;
-        document.body.setAttribute('aria-live', 'polite');
         this.saveSettings();
+        window.announce('Screen reader mode enabled');
     }
 
     saveSettings() {
@@ -545,8 +501,8 @@ const gameModeManager = new GameModeManager();
 const accessibilityManager = new AccessibilityManager();
 const spellBlocPayments = useSpellBlocPayments(); // MiniPay integration
 
-// Load analytics on startup
-adaptiveLearning.analytics.loadAnalytics();
+// Bind analytics to the active child; telemetry.js already migrated legacy storage.
+adaptiveLearning.initialize(typeof telemetry !== 'undefined' ? telemetry.getActiveChildId() : 'default');
 const curriculum = {
     age2: {
         name: "First Letters",
@@ -1562,7 +1518,7 @@ let playerLevel = parseInt(localStorage.getItem('spellbloc_playerLevel')) || 1;
 let volume = 0.7;
 let startTime = 0;
 let currentLanguage = 'en';
-let subscriptionType = 'free'; // free, premium, school
+let subscriptionType = 'free'; // Entitlement comes from the authenticated server session.
 
 // Advanced features
 const rewardSystem = new RewardSystem();
@@ -1601,7 +1557,6 @@ document.addEventListener('DOMContentLoaded', () => {
     updateAgeDisplay();
     setupEventListeners();
     setupAdvancedFeatures();
-    adaptiveLearning.analytics.startSession();
     
     // Debug: Test letter creation
     console.log('SpellBloc initialized successfully!');
@@ -1631,8 +1586,6 @@ function setupAdvancedFeatures() {
     document.getElementById('modeSelect').value = savedGameMode;
     console.log(`🎮 Loaded game mode: ${savedGameMode}`);
     
-    // Load subscription status
-    updateSubscriptionDisplay();
     
     // Debug: Log available voices for language testing
     if ('speechSynthesis' in window) {
@@ -1662,13 +1615,7 @@ function updatePerformanceDisplay() {
     if (memoryDisplay) memoryDisplay.textContent = metrics.memoryUsage;
 }
 
-function updateSubscriptionDisplay() {
-    const statusElement = document.getElementById('subscriptionStatus');
-    if (statusElement) {
-        statusElement.textContent = subscriptionType === 'premium' ? 'Premium Plan' : 'Free Plan';
-        statusElement.className = `subscription-status ${subscriptionType}`;
-    }
-}
+function updateSubscriptionDisplay() {}
 
 function updateAgeDisplay() {
     const ageData = curriculum[`age${currentAge}`];
@@ -1741,22 +1688,46 @@ function setupEventListeners() {
     volumeControl.addEventListener('input', (e) => {
         volume = e.target.value / 100;
     });
-}
 
-function showScreen(screen) {
-    document.querySelectorAll('.screen').forEach(s => s.classList.remove('active'));
-    if (screen === 'home') {
-        homeScreen.classList.add('active');
-    } else if (screen === 'game') {
-        gameScreen.classList.add('active');
-    } else if (screen === 'victory') {
-        victoryScreen.classList.add('active');
+    const hintBtn = document.getElementById('hintBtn');
+    if (hintBtn) hintBtn.addEventListener('click', showHint);
+
+    const parentDashboardBtn = document.getElementById('parentDashboardBtn');
+    if (parentDashboardBtn) parentDashboardBtn.addEventListener('click', showParentDashboard);
+
+    const dashboardBackBtn = document.getElementById('dashboardBackBtn');
+    if (dashboardBackBtn) dashboardBackBtn.addEventListener('click', () => showScreen('home'));
+
+    const addCustomWordsBtn = document.getElementById('addCustomWordsBtn');
+    if (addCustomWordsBtn) addCustomWordsBtn.addEventListener('click', addCustomWords);
+
+    const childSelect = document.getElementById('childSelect');
+    if (childSelect) {
+        childSelect.addEventListener('change', (e) => {
+            switchActiveChild(e.target.value);
+        });
+    }
+
+    const addChildBtn = document.getElementById('addChildBtn');
+    if (addChildBtn) {
+        addChildBtn.addEventListener('click', () => {
+            const input = document.getElementById('newChildName');
+            const name = (input && input.value || '').trim();
+            if (!name) return;
+            const id = parentDashboard.createChildProfile(name);
+            switchActiveChild(id);
+            if (input) input.value = '';
+        });
     }
 }
 
 function startGame() {
     const currentMode = gameModeManager.getCurrentMode();
     startTime = Date.now();
+    adaptiveLearning.analytics.startSession({
+        mode: gameModeManager.currentMode || 'classic',
+        difficulty: adaptiveLearning.difficultyLevel || null
+    });
     
     // Show instructions first
     showGameInstructions();
@@ -1791,6 +1762,8 @@ function loadWord() {
     const wordObj = words[currentWordIndex];
     currentWord = wordObj.word;
     userAnswer = [];
+    startTime = Date.now();
+    if (typeof telemetry !== 'undefined') telemetry.resetHints();
 
     // Update UI
     wordImage.textContent = wordObj.emoji;
@@ -1804,9 +1777,10 @@ function loadWord() {
     // Create drop zone slots
     dropZone.innerHTML = '';
     for (let i = 0; i < currentWord.length; i++) {
-        const slot = document.createElement('div');
+        const slot = document.createElement('button');
         slot.className = 'letter-slot';
         slot.dataset.index = i;
+        slot.setAttribute('aria-label', `Empty slot ${i + 1} of ${currentWord.length}`);
         dropZone.appendChild(slot);
     }
 
@@ -1821,6 +1795,8 @@ function loadWord() {
     } else {
         setTimeout(() => speakWord(currentWord), 500);
     }
+    
+    window.announce(`Spell the word: ${currentWord}. There are ${currentWord.length} letters.`, true);
 }
 
 function createLetterBank() {
@@ -1836,11 +1812,12 @@ function createLetterBank() {
     letterBank.style.opacity = '1';
     
     scrambled.forEach((letter, index) => {
-        const tile = document.createElement('div');
+        const tile = document.createElement('button');
         tile.className = 'letter-tile';
         tile.textContent = letter.toUpperCase();
         tile.dataset.letter = letter;
         tile.dataset.id = index;
+        tile.setAttribute('aria-label', `Letter ${letter.toUpperCase()}`);
         
         // Ensure proper styling and visibility
         tile.style.display = 'flex';
@@ -1872,13 +1849,16 @@ function handleLetterClick(tile) {
     if (currentSlotIndex < currentWord.length) {
         userAnswer.push({ letter, tileId: tile.dataset.id });
         tile.classList.add('used');
+        tile.setAttribute('aria-disabled', 'true');
 
         const slot = dropZone.children[currentSlotIndex];
         slot.textContent = letter.toUpperCase();
         slot.classList.add('filled');
         slot.dataset.tileId = tile.dataset.id;
+        slot.setAttribute('aria-label', `Slot ${currentSlotIndex + 1} contains letter ${letter.toUpperCase()}`);
 
         playSound('pop');
+        window.announce(`Letter ${letter.toUpperCase()} added.`, false);
 
         // Add click to remove
         slot.addEventListener('click', () => removeLetterFromSlot(slot, currentSlotIndex));
@@ -1897,6 +1877,7 @@ function removeLetterFromSlot(slot, slotIndex) {
     
     if (tile) {
         tile.classList.remove('used');
+        tile.removeAttribute('aria-disabled');
     }
 
     userAnswer.splice(slotIndex, 1);
@@ -1906,12 +1887,16 @@ function removeLetterFromSlot(slot, slotIndex) {
             s.textContent = userAnswer[i].letter.toUpperCase();
             s.classList.add('filled');
             s.dataset.tileId = userAnswer[i].tileId;
+            s.setAttribute('aria-label', `Slot ${i + 1} contains letter ${userAnswer[i].letter.toUpperCase()}`);
         } else {
             s.textContent = '';
             s.classList.remove('filled');
             delete s.dataset.tileId;
+            s.setAttribute('aria-label', `Empty slot ${i + 1}`);
         }
     });
+    
+    window.announce(`Letter removed. ${currentWord.length - userAnswer.length} slots left.`, false);
 }
 
 function deleteLast() {
@@ -1972,11 +1957,11 @@ function handleCorrectAnswer() {
     feedback.textContent = multiLanguage.translate('perfect') || '🎉 Perfect! Great job!';
     feedback.className = 'feedback correct';
     
+    window.announce('Correct!', true);
+    
     playSound('success');
     
-    // Record performance for adaptive learning
-    adaptiveLearning.adjustDifficulty(true, timeToComplete);
-    adaptiveLearning.scheduleSpacedRepetition(currentWord, adaptiveLearning.difficultyLevel);
+    adaptiveLearning.recordAttempt(currentWord, currentCategory, true, timeToComplete * 1000);
     
     // Update difficulty indicator
     const difficultyElement = document.getElementById('difficultyLevel');
@@ -2012,8 +1997,10 @@ function handleCorrectAnswer() {
     saveProgress();
     
     // Celebrate animation
-    wordImage.classList.add('celebrate');
-    setTimeout(() => wordImage.classList.remove('celebrate'), 500);
+    if (!accessibilityManager.settings.reducedMotion) {
+        wordImage.classList.add('celebrate');
+        setTimeout(() => wordImage.classList.remove('celebrate'), 500);
+    }
     
     // Auto-advance to next word or show round complete
     currentWordIndex++;
@@ -2039,10 +2026,11 @@ function handleIncorrectAnswer() {
     feedback.textContent = multiLanguage.translate('try_again') || '🤔 Try again! You can do it!';
     feedback.className = 'feedback incorrect';
     
+    window.announce('Try again!', true);
+    
     playSound('error');
     
-    // Record performance for adaptive learning
-    adaptiveLearning.adjustDifficulty(false, timeToComplete);
+    adaptiveLearning.recordAttempt(currentWord, currentCategory, false, timeToComplete * 1000);
     
     // Update difficulty indicator
     const difficultyElement = document.getElementById('difficultyLevel');
@@ -2079,6 +2067,11 @@ function nextWord() {
     
     currentCategory = categories[nextIndex];
     currentWordIndex = 0;
+    startTime = Date.now();
+    adaptiveLearning.analytics.startSession({
+        mode: gameModeManager.currentMode || 'classic',
+        difficulty: adaptiveLearning.difficultyLevel || null
+    });
     showScreen('game');
     loadWord();
 }
@@ -2161,43 +2154,72 @@ document.addEventListener('touchstart', (e) => {
     touchStartY = e.touches[0].clientY;
 }, { passive: true });
 
-document.addEventListener('touchmove', (e) => {
-    // Prevent scrolling while playing
-    if (gameScreen.classList.contains('active')) {
-        e.preventDefault();
-    }
-}, { passive: false });
 // Advanced Feature Functions
+
+function switchActiveChild(childId) {
+    const id = telemetry.setActiveChild(childId);
+    adaptiveLearning.initialize(id);
+    rewardSystem.setChild(id);
+    updateDashboardContent();
+}
 
 function showParentDashboard() {
     showScreen('dashboard');
     updateDashboardContent();
 }
 
+function renderChildSwitcher() {
+    const select = document.getElementById('childSelect');
+    const label = document.getElementById('activeChildLabel');
+    if (!select || typeof telemetry === 'undefined') return;
+    const active = telemetry.getActiveChildId();
+    select.innerHTML = telemetry.listChildren().map((child) => (
+        `<option value="${child.id}"${child.id === active ? ' selected' : ''}>${child.name}</option>`
+    )).join('');
+    if (label) label.textContent = `Showing reports for ${telemetry.dumpChild(active).name}`;
+}
+
 function updateDashboardContent() {
-    const report = parentDashboard.generateProgressReport('default', 'week');
-    
-    // Update progress stats
+    const childId = typeof telemetry !== 'undefined' ? telemetry.getActiveChildId() : 'default';
+    const report = parentDashboard.generateProgressReport(childId, 'week');
+    renderChildSwitcher();
+
     const statsContainer = document.getElementById('progressStats');
     if (statsContainer && report) {
+        const summary = report.summary;
         statsContainer.innerHTML = `
             <div class="progress-stat">
-                <div class="value">${report.summary.totalSessions}</div>
+                <div class="value">${summary.totalSessions}</div>
                 <div class="label">Sessions</div>
             </div>
             <div class="progress-stat">
-                <div class="value">${report.summary.accuracy}%</div>
+                <div class="value">${summary.accuracy}%</div>
                 <div class="label">Accuracy</div>
             </div>
             <div class="progress-stat">
-                <div class="value">${report.summary.totalAttempts}</div>
-                <div class="label">Words Practiced</div>
+                <div class="value">${summary.totalAttempts}</div>
+                <div class="label">Attempts</div>
             </div>
             <div class="progress-stat">
-                <div class="value">${Math.round(report.summary.averageSessionTime / 60)}m</div>
+                <div class="value">${summary.uniqueWordsLearned}</div>
+                <div class="label">Words Learned</div>
+            </div>
+            <div class="progress-stat">
+                <div class="value">${typeof summary.averageTime === 'number' ? summary.averageTime.toFixed(1) : 0}s</div>
+                <div class="label">Avg Time</div>
+            </div>
+            <div class="progress-stat">
+                <div class="value">${Math.round((summary.averageSessionTime || 0) / 60)}m</div>
                 <div class="label">Avg Session</div>
             </div>
         `;
+    }
+
+    const chart = document.getElementById('progressChart');
+    if (chart && report) {
+        const weak = (report.summary.weakAreas || []).map((a) => `${a.category} ${Math.round(a.accuracy)}%`).join(', ') || 'none';
+        const strong = (report.summary.strongAreas || []).map((a) => `${a.category} ${Math.round(a.accuracy)}%`).join(', ') || 'none';
+        chart.innerHTML = `<p>Weak: ${weak}</p><p>Strong: ${strong}</p>`;
     }
     
     // Update achievements
@@ -2259,10 +2281,11 @@ function removeCustomWord(word) {
 
 function showHint() {
     if (subscriptionType === 'free') {
-        showUpgradeModal();
+        showParentAccessNotice();
         return;
     }
     
+    if (typeof telemetry !== 'undefined') telemetry.recordHint();
     const hintText = `The word starts with "${currentWord[0].toUpperCase()}"`;
     feedback.textContent = `💡 Hint: ${hintText}`;
     feedback.className = 'feedback hint';
@@ -2273,7 +2296,9 @@ function showHint() {
     }, 3000);
 }
 
-function showUpgradeModal() {
+function showParentAccessNotice() {
+    alert('Ask your parent to enable extra learning tools from their dashboard.');
+    return;
     const modal = document.createElement('div');
     modal.className = 'upgrade-modal';
     modal.innerHTML = `
